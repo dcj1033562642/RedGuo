@@ -31,8 +31,8 @@ KEYTOOL = os.path.join(JAVA_HOME, "bin", "keytool.exe")
 
 MIN_SDK = "29"
 TARGET_SDK = "35"
-VERSION_CODE = "49"
-VERSION_NAME = "2.31"
+VERSION_CODE = "55"
+VERSION_NAME = "2.37"
 
 
 def run(cmd, cwd=None, check=True):

@@ -135,6 +135,12 @@ public final class UiController {
         return sTop;
     }
 
+    /** 诊断用：当前栈顶 Activity 简名。 */
+    public static String topActivitySimple() {
+        Activity a = sTop;
+        return a == null ? "?" : a.getClass().getSimpleName();
+    }
+
     private static boolean isHost(Activity a) {
         return a != null && RGModule.HOST_PKG.equals(a.getPackageName());
     }
@@ -1457,12 +1463,17 @@ public final class UiController {
     }
 
     /**
-     * 是否需要吞掉触发前的点击：吞掉后宿主收不到完整连击，
-     * 「双击点赞」「双击暂停」都不会发生。
-     * 首页的双击点赞已由 onDoubleTap hook 直接屏蔽，无需再吞。
+     * 是否需要吞掉触发前的点击：只吞 **横屏** —— 横屏的连击是三击，
+     * 前两击放行会触发宿主的「双击暂停」，所以整段吞掉。
+     *
+     * 竖屏两个页面都**不吞**（7.3.9.32 实测）：
+     *   首页：吞第二次点击会让宿主把第一击当「单击确认」→ 直接跳转播放页，评论区就没了；
+     *         双击点赞由 onDoubleTap hook（fullscreen.i$d + social.ui.t）直接屏蔽。
+     *   二级页：单击视频 = 暂停/恢复切换。吞第二次会让 tap1 的「暂停」留在屏幕上
+     *         （打开评论区但视频停住）；放行 tap2 则 tap1 暂停 → tap2 恢复，净效果=播放中。
      */
     private static boolean needSwallow(Activity a) {
-        return !a.getClass().getName().endsWith("MainFragmentActivity");
+        return isLandscape(a);
     }
 
     /**
@@ -1530,6 +1541,33 @@ public final class UiController {
             logFile("tap x" + need + " landscape=" + land + " swallowed=" + swallowed
                     + " act=" + a.getClass().getSimpleName());
             openComment(a);
+            if (a.getClass().getName().endsWith("MainFragmentActivity")) {
+                // 首页信息流：tap1 已被宿主当「单击暂停」，补一击恢复播放
+                //（tap2 被宿主的双击检测吸收，不会自己恢复）
+                final float ix = ev.getX();
+                final float iy = ev.getY();
+                UI.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        injectTap(a, ix, iy);
+                    }
+                }, 400L);
+            }
+        }
+    }
+
+    /** 往宿主注入一次轻点（DOWN+UP），用于恢复被 tap1 暂停的信息流视频。 */
+    private static void injectTap(Activity a, float x, float y) {
+        try {
+            long now = SystemClock.uptimeMillis();
+            MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
+            MotionEvent up = MotionEvent.obtain(now, now + 50, MotionEvent.ACTION_UP, x, y, 0);
+            a.dispatchTouchEvent(down);
+            a.dispatchTouchEvent(up);
+            down.recycle();
+            up.recycle();
+            logFile("feed: resume tap injected");
+        } catch (Throwable ignored) {
         }
     }
 

@@ -35,6 +35,11 @@ public class RGModule extends XposedModule {
             // 旧版本（7.3.2.x / 7.3.3.x）
             "com.dragon.read.component.shortvideo.impl.fullscreen.d$d",
             "com.dragon.read.component.shortvideo.impl.fullscreen.f$d",
+            // 7.3.9.32：feed 双击点赞走社交层手势（实测屏蔽 i$d 后仍会点赞）
+            "com.dragon.read.social.ui.t",
+            // 7.3.9.32：短剧 v2 竖滑适配器的双击监听（feed 与二级页共用，
+            // dt2 诊断日志确认真实触发，屏蔽后双击点赞消失）
+            "r65.o0",
     };
 
     private ClassLoader appLoader;
@@ -63,6 +68,11 @@ public class RGModule extends XposedModule {
             hookDoubleTap(appLoader);
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hookDoubleTap failed", t);
+        }
+        try {
+            hookDoubleTapDiag(appLoader);
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hookDoubleTapDiag failed", t);
         }
         try {
             hookSheetWindows(appLoader);
@@ -179,6 +189,8 @@ public class RGModule extends XposedModule {
                             // 正常路径下触发前的点击已被 UiController 吞掉，
                             // 宿主收不到完整连击；这里再挡一道兜底，确保不暂停、不点赞。
                             if (act != null && Config.doubleTapComment(act)) {
+                                UiController.logFile("dt: blocked onDoubleTap on "
+                                        + chain.getThisObject().getClass().getName());
                                 return Boolean.FALSE;
                             }
                             return chain.proceed();
@@ -190,6 +202,48 @@ public class RGModule extends XposedModule {
         if (n == 0) {
             log(Log.WARN, TAG, "no onDoubleTap hooked");
         }
+    }
+
+    /**
+     * 诊断：把宿主里所有声明 onDoubleTap 的混淆类都挂上「只记日志」的钩子，
+     * 用于定位 feed 双击点赞的真实处理类（用户真机双击一次即可从日志看出是谁）。
+     */
+    private void hookDoubleTapDiag(ClassLoader cl) {
+        String[] candidates = {
+                "i57.a0", "lv6.k0$a", "r47.p2$b", "w37.x3", "wd.b$c", "gc8.b$c",
+                "ah2.s$d", "ch2.d$c$a", "ch2.q$b", "pc2.h$b", "pc2.j", "pc2.o$c",
+                "dw2.g", "dw2.o$c", "nn2.o", "es4.a", "e55.h", "kx4.m", "wp4.e",
+                "r65.o0", "kc6.s", "bt6.y",
+        };
+        int n = 0;
+        for (String cn : candidates) {
+            try {
+                Class<?> cls = tryLoad(cl, cn);
+                if (cls == null) {
+                    continue;
+                }
+                for (final Method m : cls.getDeclaredMethods()) {
+                    if (!"onDoubleTap".equals(m.getName()) || m.getParameterCount() != 1
+                            || !MotionEvent.class.equals(m.getParameterTypes()[0])) {
+                        continue;
+                    }
+                    m.setAccessible(true);
+                    hook(m).setId("rgDtDiag_" + cn)
+                            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                            .intercept(chain -> {
+                                try {
+                                    UiController.logFile("dt2: " + cn
+                                            + " act=" + UiController.topActivitySimple());
+                                } catch (Throwable ignored) {
+                                }
+                                return chain.proceed();
+                            });
+                    n++;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        UiController.logFile("dt2 diag hooked=" + n);
     }
 
     /* ------------------------------------------------------------------ */
