@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标前景层（108x108，可见区是中央 72x72）。
+  低饱和暖橙红 #CB8168（H15 S49 L60），实测控制在 66dp 安全圆内。
+  圆角三角形用的是 strokeLineJoin=round：路径本身按 7 内缩，再描 14 宽的圆角边，
+  外轮廓正好回到目标尺寸 35..77 / 30..78，圆角半径 7。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#CB8168"
+        android:strokeColor="#CB8168"
+        android:strokeWidth="14"
+        android:strokeLineJoin="round"
+        android:pathData="M42,42.06 L62.89,54 L42,65.94 Z" />
+</vector>
