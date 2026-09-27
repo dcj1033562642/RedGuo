@@ -6,9 +6,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.content.res.Resources;
+import android.graphics.Insets;
 import android.graphics.Color;
-import android.os.BatteryManager;
 import android.os.Build;
+import android.os.BatteryManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -30,11 +31,9 @@ import android.widget.TextView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.lang.ref.WeakReference;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.Date;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -42,14 +41,11 @@ import java.util.Locale;
 import java.util.WeakHashMap;
 
 /**
- * 宿主进程内的界面控制：状态栏、叠加组件的隐藏/透明度、长按入口、双击打开评论区。
+ * 宿主进程内的界面控制：状态栏、底部导航栏、叠加组件的隐藏/透明度、长按入口、双击打开评论区。
  *
- * 关于状态栏：Android 上「隐藏状态栏但保留一条纯色横条、点击才出现数字」并不能靠
- * 系统 API 直接做到，且部分模拟器（如 MuMu 的独立虚拟屏）根本没有 SystemUI 状态栏窗口。
- * 因此这里的做法是：
- *   1. 仍然控制真实系统状态栏的显示/隐藏（真机上有效）；
- *   2. 在窗口顶部铺一条自绘横条作为「状态栏」载体，数字由模块自己绘制；
- *   3. 点击该横条时，先尝试显示真实系统栏，若系统栏在该屏实际不可见，则由自绘数字兜底。
+ * 关于状态栏：支持「隐藏系统状态栏 + 自绘底色横条」。
+ * 早期版本还有「点击横条临时显示时间/电量数字」，该子功能已移除 ——
+ * 现在横条只负责底色，不再承载任何数字与交互。
  *
  * 关于组件控制：不再写死「三个浮层」，而是
  *   内置槽位（Config.SLOT_*}）+ 用户自定义清单（Config.overlayList）
@@ -88,6 +84,26 @@ public final class UiController {
     /** 清屏空闲隐藏：无触摸多久后收起其余控件（仅二级播放页 + 清屏开启时）。 */
     private static final long IDLE_HIDE_MS = 10000L;
 
+    /**
+     * 导航栏隐藏态标记：用 Map 而非 View tag —— 导航栏是 SystemUI 的独立窗口，
+     * 模块拿不到它的 View，没有 tag 可打。
+     *
+     * <p>语义：值 = 本模块是否已请求隐藏。用于避免每轮循环重复调用 hide()，
+     * 也用于在 App 退到后台时决定要不要还回去。
+     */
+    private static final WeakHashMap<Activity, Boolean> NAV_HIDDEN_MARK = new WeakHashMap<>();
+
+    /**
+     * 整个 App 当前是否处于前台。
+     *
+     * <p>用来区分「App 内部切页面」与「真的离开 App」：只有后者才恢复导航栏。
+     * 计数器而非布尔 —— 页面切换时新旧 Activity 的 pause/stop 会交错。
+     */
+    private static int sForegroundCount = 0;
+
+    /** 本页面见过的导航栏最大高度，供隐藏后继续使用（隐藏后 insets 会归零）。 */
+    private static final WeakHashMap<Activity, Integer> NAV_BASE_H = new WeakHashMap<>();
+
     /** 连击计数：竖屏双击、横屏三击打开评论区。 */
     private static final class Tap {
         long lastUp;
@@ -99,7 +115,6 @@ public final class UiController {
     }
 
     private static final Handler UI = new Handler(Looper.getMainLooper());
-    private static final SimpleDateFormat HHMM = new SimpleDateFormat("HH:mm", Locale.getDefault());
 
     /*
      * 「叠加组件透明度」不再维护自己的目标清单。
@@ -145,6 +160,11 @@ public final class UiController {
         return a != null && RGModule.HOST_PKG.equals(a.getPackageName());
     }
 
+    /** 该 Activity 是否属于红果（供 RGModule 的生命周期钩子判断，避免误统计别家 App）。 */
+    public static boolean isHostActivity(Activity a) {
+        return isHost(a);
+    }
+
     private static int dp(Context c, float v) {
         return (int) (v * c.getResources().getDisplayMetrics().density + 0.5f);
     }
@@ -187,145 +207,6 @@ public final class UiController {
             }
         } catch (Throwable ignored) {
         }
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* 状态栏自绘载体                                                       */
-    /* ------------------------------------------------------------------ */
-
-    /** 数字显示后无操作自动收起的延时。 */
-    private static final long AUTO_HIDE_MS = 1000L;
-
-    private static final class Bar {
-        Activity act;
-        LinearLayout root;
-        TextView time;
-        TextView battery;
-        boolean numbers;          // 是否显示数字
-        boolean systemBarOwned;   // 真实系统栏是否真的显示出来了
-
-        /** 一段时间无操作后自动收起状态栏。 */
-        final Runnable autoHide = new Runnable() {
-            @Override
-            public void run() {
-                if (!numbers) {
-                    return;
-                }
-                numbers = false;
-                systemBarOwned = false;
-                setSystemBarVisible(act, false);
-                render(act);
-                Log.i(TAG, "status bar auto-hidden");
-            }
-        };
-
-        final Runnable tick = new Runnable() {
-            @Override
-            public void run() {
-                updateClock();
-                root.postDelayed(this, 15000);
-            }
-        };
-
-        void updateClock() {
-            time.setText(HHMM.format(new Date()));
-        }
-    }
-
-    private static Bar buildBar(final Activity a) {
-        Bar b = new Bar();
-        LinearLayout bar = new LinearLayout(a);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(dp(a, 16), 0, dp(a, 16), 0);
-
-        TextView t = new TextView(a);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        t.setTextColor(Color.WHITE);
-        bar.addView(t, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        TextView bt = new TextView(a);
-        bt.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        bt.setTextColor(Color.WHITE);
-        bar.addView(bt, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        bar.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                if (!Config.tapToggle(a) || !Config.hideStatusBar(a)) {
-                    return;
-                }
-                Bar bb = BARS.get(a);
-                if (bb == null) {
-                    return;
-                }
-                bb.numbers = !bb.numbers;
-                setSystemBarVisible(a, bb.numbers);
-                bb.root.removeCallbacks(bb.autoHide);
-                if (bb.numbers) {
-                    // 显示后无操作 1 秒自动收起
-                    bb.root.postDelayed(bb.autoHide, AUTO_HIDE_MS);
-                }
-                UI.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        Bar x = BARS.get(a);
-                        if (x != null) {
-                            x.systemBarOwned = systemBarVisible(a);
-                            render(a);
-                        }
-                    }
-                }, 120);
-                render(a);
-            }
-        });
-
-        b.root = bar;
-        b.time = t;
-        b.battery = bt;
-        b.act = a;
-        bar.setTag(b);
-        return b;
-    }
-
-    private static boolean systemBarVisible(Activity a) {
-        try {
-            View decor = a.getWindow().getDecorView();
-            WindowInsets wi = decor.getRootWindowInsets();
-            return wi != null && wi.isVisible(WindowInsets.Type.statusBars());
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private static int statusBarHeight(Context c) {
-        Resources r = c.getResources();
-        int id = r.getIdentifier("status_bar_height", "dimen", "android");
-        if (id > 0) {
-            int h = r.getDimensionPixelSize(id);
-            if (h > 0) {
-                return h;
-            }
-        }
-        return dp(c, 24);
-    }
-
-    private static String batteryText(Context c) {
-        try {
-            Intent it = c.registerReceiver(null,
-                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-            if (it != null) {
-                int level = it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-                int scale = it.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
-                if (level >= 0 && scale > 0) {
-                    return (level * 100 / scale) + "%";
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-        return "";
     }
 
     /* ------------------------------------------------------------------ */
@@ -379,6 +260,8 @@ public final class UiController {
         }
         sTop = a;
         logFile("activity resumed: " + a.getClass().getName());
+        // 前台计数 +1（与 RGModule 的 onStop 钩子配对），供导航栏「仅退出时恢复」判断
+        onAppForeground(a);
         try {
             applyStatusBar(a);
             applyOverlays(a);
@@ -460,16 +343,46 @@ public final class UiController {
         }
     }
 
-    public static void resetBarVisible(Activity a, boolean numbers) {
-        Bar b = BARS.get(a);
-        if (b != null) {
-            b.numbers = numbers;
-        }
+    /* ------------------------------------------------------------------ */
+    /* 状态栏：隐藏系统栏 + 自绘底色横条                                     */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * 状态栏自绘载体的状态。
+     *
+     * <p>它只做一件事：当「隐藏系统状态栏」开启时，在窗口顶部铺一条横条来填底色，
+     * 避免系统栏被隐藏后露出一条突兀的空隙。**不承载任何文字与交互** ——
+     * 早期的「点击显示时间/电量数字」子功能已移除。
+     */
+    private static final class Bar {
+        LinearLayout root;
     }
 
-    /* ------------------------------------------------------------------ */
-    /* 状态栏应用逻辑                                                       */
-    /* ------------------------------------------------------------------ */
+    private static Bar buildBar(final Activity a) {
+        Bar b = new Bar();
+        LinearLayout bar = new LinearLayout(a);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setPadding(dp(a, 16), 0, dp(a, 16), 0);
+        bar.setClickable(false);
+        bar.setFocusable(false);
+
+        b.root = bar;
+        bar.setTag(b);
+        return b;
+    }
+
+    private static int statusBarHeight(Context c) {
+        Resources r = c.getResources();
+        int id = r.getIdentifier("status_bar_height", "dimen", "android");
+        if (id > 0) {
+            int h = r.getDimensionPixelSize(id);
+            if (h > 0) {
+                return h;
+            }
+        }
+        return dp(c, 24);
+    }
 
     private static void applyStatusBar(Activity a) {
         if (!isHost(a)) {
@@ -496,66 +409,33 @@ public final class UiController {
         }
 
         boolean hide = Config.hideStatusBar(a);
-        if (hide) {
-            setSystemBarVisible(a, b.numbers);
-            final Bar fb = b;
-            UI.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    Bar x = BARS.get(a);
-                    if (x != null) {
-                        x.systemBarOwned = systemBarVisible(a);
-                        render(a);
-                    }
-                }
-            }, 150);
-        } else {
-            // 不隐藏：让真实系统栏自行显示，自绘条完全让位
-            setSystemBarVisible(a, true);
-            b.numbers = false;
-            b.systemBarOwned = true;
-        }
+        setSystemBarVisible(a, !hide);
         b.root.getLayoutParams().height = statusBarHeight(a);
         render(a);
     }
 
+    /**
+     * 按配置渲染底色横条。
+     *
+     * <p>不隐藏系统栏时横条完全让位（{@code GONE}）；已移除原有数字绘制与定时刷新。
+     */
     private static void render(Activity a) {
         Bar b = BARS.get(a);
         if (b == null) {
             return;
         }
-        boolean hide = Config.hideStatusBar(a);
-        int bg = Config.statusBarBg(a);
-
-        if (!hide) {
-            // 用真实系统栏，自绘条隐藏
+        if (!Config.hideStatusBar(a)) {
             b.root.setVisibility(View.GONE);
             return;
         }
         b.root.setVisibility(View.VISIBLE);
 
+        int bg = Config.statusBarBg(a);
         int color = bg == Config.BG_BLACK ? Color.BLACK
                 : bg == Config.BG_WHITE ? Color.WHITE
                 : Color.TRANSPARENT;
         b.root.setBackgroundColor(color);
 
-        int textColor = (color == Color.WHITE) ? Color.BLACK : Color.WHITE;
-        b.time.setTextColor(textColor);
-        b.battery.setTextColor(textColor);
-
-        if (b.numbers && !b.systemBarOwned) {
-            b.updateClock();
-            b.battery.setText(batteryText(a));
-            b.time.setVisibility(View.VISIBLE);
-            b.battery.setVisibility(View.VISIBLE);
-            b.root.removeCallbacks(b.tick);
-            b.root.postDelayed(b.tick, 15000);
-        } else {
-            b.time.setVisibility(View.GONE);
-            b.battery.setVisibility(View.GONE);
-            b.root.removeCallbacks(b.tick);
-        }
-        b.root.setClickable(Config.tapToggle(a) && hide);
         // 宿主可能在我们之后继续往 DecorView 加子视图，重新置顶避免被盖住
         try {
             b.root.bringToFront();
@@ -668,6 +548,7 @@ public final class UiController {
         applyDesired(root, desired);
         applyBottomTabs(root, a);
         applyIdleClear(root, a);
+        applyNavAutoHide(a);
     }
 
     /* ------------------------------------------------------------------ */
@@ -749,6 +630,42 @@ public final class UiController {
                 tab.setVisibility(View.VISIBLE);
             }
         }
+    }
+
+    /** 供面板显示导航栏状态（诊断用）。全部基于 insets 实测，不靠推断。 */
+    public static String navBarStatus(Activity a) {
+        if (a == null || !isHost(a)) {
+            return "（未在红果内）";
+        }
+        try {
+            StringBuilder sb = new StringBuilder();
+            int h = navBarHeight(a);
+            boolean vis = !navBarHiddenNow(a);
+            sb.append("导航栏高度 ").append(h).append("px")
+                    .append(" · 当前").append(vis ? "可见" : "已隐藏");
+            sb.append(" · ").append(Boolean.TRUE.equals(NAV_HIDDEN_MARK.get(a))
+                    ? "本模块已接管" : "未接管");
+            try {
+                int m = android.provider.Settings.Secure.getInt(
+                        a.getContentResolver(), "navigation_mode");
+                sb.append(" · ").append(m == 2 ? "手势导航" : (m == 0 ? "三键导航" : "mode=" + m));
+            } catch (Throwable ignored) {
+            }
+            if (h <= 0) {
+                sb.append("（本机未上报导航栏 insets，暂不可控）");
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "读取失败：" + t;
+        }
+    }
+
+    /** 供面板显示：开关是否处于「App 内已生效」状态。 */
+    public static String navBarEnableState() {
+        if (sForegroundCount <= 0) {
+            return "（App 不在前台，导航栏已恢复）";
+        }
+        return "已生效 · 红果内全程隐藏，退出红果时自动恢复";
     }
 
     /* ------------------------------------------------------------------ */
@@ -884,6 +801,256 @@ public final class UiController {
         }
         IDLE_HIDDEN.put(a, toHide);
         logFile("idle: clear-screen " + (IDLE_HIDE_MS / 1000) + "s -> hide " + toHide.size());
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 底部导航栏（小白条）：静置自动隐藏、触摸/下滑到底部时唤出              */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * 底部导航栏（小白条）自动隐藏 —— 走系统 insets 控制器。
+     *
+     * <p><b>为什么不能用 setVisibility：</b>实测（小米15 / 红果 7.3.9.32）导航栏是
+     * SystemUI 的**独立窗口**（{@code Window{... NavigationBar0} pkg=com.android.systemui}
+     * {@code ty=NAVIGATION_BAR}），跨进程，模块拿不到它的 View，改不了。
+     * 红果 {@code ScreenUtils.getCurrentNaviBarHeight()} 里那个
+     * {@code findViewById(0x1020030)} 找的是**它自己窗口内**的同名占位视图，不是真小白条。
+     *
+     * <p>因此只能走 {@link WindowInsetsController#hide(int)}。好处是系统原生支持
+     * 「隐藏 + 滑动临时唤出」——正是需求要的语义，且用
+     * {@code BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE} 时滑出的是临时浮层，不来就永远不来。
+     *
+     * <p>红果窗口带 {@code FIT_INSETS_CONTROLLED}（实测确认），说明它没有锁死 insets，
+     * 我们的调用有生效空间。
+     */
+    private static WindowInsetsController insetsController(Activity a) {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                return null;
+            }
+            Window w = a.getWindow();
+            return w != null ? w.getInsetsController() : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 隐藏导航栏。 */
+    private static void hideNavBar(Activity a) {
+        try {
+            WindowInsetsController ic = insetsController(a);
+            if (ic != null) {
+                ic.hide(WindowInsets.Type.navigationBars());
+                NAV_HIDDEN_MARK.put(a, Boolean.TRUE);
+                // 系统会在 ~50ms 后才更新 insets，延迟回读一次确认，便于排查
+                final Activity act = a;
+                UI.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!Boolean.TRUE.equals(NAV_HIDDEN_MARK.get(act))) {
+                            logFile("nav: hide reverted by host (h=" + navBarHeight(act) + ")");
+                        }
+                    }
+                }, 500L);
+                return;
+            }
+            // Android 11 以下：退回系统 UI flag
+            View decor = a.getWindow().getDecorView();
+            if (decor != null) {
+                decor.setSystemUiVisibility(decor.getSystemUiVisibility()
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+                NAV_HIDDEN_MARK.put(a, Boolean.TRUE);
+                logFile("nav: hide via legacy flags");
+            }
+        } catch (Throwable t) {
+            logFile("nav hide failed: " + t);
+        }
+    }
+
+    /**
+     * 唤出导航栏（仅用于「开关被关掉」这一场景）。
+     *
+     * <p>只在「确实是本模块藏的」时才恢复 —— 宿主自己藏的不碰，沿用既有归属哲学。
+     * 退出软件的场景不走这里，走 {@link #restoreNavBar}，那是无条件恢复。
+     */
+    private static void showNavBar(Activity a) {
+        try {
+            if (!Boolean.TRUE.equals(NAV_HIDDEN_MARK.get(a))) {
+                return;   // 不是我们藏的，不去动
+            }
+            WindowInsetsController ic = insetsController(a);
+            if (ic != null) {
+                ic.show(WindowInsets.Type.navigationBars());
+                NAV_HIDDEN_MARK.remove(a);
+                return;
+            }
+            View decor = a.getWindow().getDecorView();
+            if (decor != null) {
+                decor.setSystemUiVisibility(decor.getSystemUiVisibility()
+                        & ~View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+                NAV_HIDDEN_MARK.remove(a);
+            }
+        } catch (Throwable t) {
+            logFile("nav show failed: " + t);
+        }
+    }
+
+    /**
+     * 导航栏当前是否处于「隐藏」状态。
+     *
+     * <p><b>不能只看 {@code isVisible()}。</b>实测（小米15）导航栏被 hide 之后，
+     * 系统的 navigationBars insets 会归零，此时 {@code isVisible(navigationBars())}
+     * 反而报 true —— 只按它判断会让每轮循环都重复调用 hide（实测日志 1.2 秒刷一次）。
+     *
+     * <p>判定顺序：先看是不是我们自己藏的（最可靠）；否则用 insets 兜底 ——
+     * 系统 insets 高度归零或 isVisible 为 false 都算隐藏，避免重复操作宿主已藏的导航栏。
+     */
+    private static boolean navBarHiddenNow(Activity a) {
+        if (Boolean.TRUE.equals(NAV_HIDDEN_MARK.get(a))) {
+            return true;
+        }
+        try {
+            View decor = a.getWindow().getDecorView();
+            WindowInsets wi = decor.getRootWindowInsets();
+            if (wi == null) {
+                return false;
+            }
+            if (!wi.isVisible(WindowInsets.Type.navigationBars())) {
+                return true;
+            }
+            // insets 归零：系统此刻没有导航栏占位（可能是被 hide 后的状态）
+            return wi.getInsets(WindowInsets.Type.navigationBars()).bottom <= 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 周期调用：把导航栏钉死在隐藏态。
+     *
+     * <p><b>需求语义：软件内全程不显示导航栏，只有退出软件才恢复。</b>
+     * 因此这里不做任何「触摸唤出 / 静置隐藏」的时间判断 —— 只要开关开着且 App 在前台，
+     * 每一轮都确认它是藏着的。
+     *
+     * <p>为什么必须每轮确认：Android 会在这些时机**强制恢复**导航栏，
+     * 单次 {@code hide()} 根本守不住 ——
+     * <ul>
+     *   <li>下拉通知栏 / 上滑进最近任务 / 手势导航条被系统短暂拉起；</li>
+     *   <li>输入法弹出、对话框获得焦点；</li>
+     *   <li>Activity 切换时 insets 重新下发。</li>
+     * </ul>
+     * 周期性重新 hide 是唯一可靠的压制手段。复用既有的 1.2s 重应用循环，
+     * 不额外开线程。
+     */
+    private static void applyNavAutoHide(final Activity a) {
+        if (!Config.autoHideNav(a)) {
+            // 开关关掉时，把之前藏过的还回去，别留下半截状态
+            if (Boolean.TRUE.equals(NAV_HIDDEN_MARK.get(a))) {
+                showNavBar(a);
+            }
+            return;
+        }
+        // App 不在前台就别压着了 —— 退出软件要让系统导航栏正常显示
+        if (sForegroundCount <= 0) {
+            if (Boolean.TRUE.equals(NAV_HIDDEN_MARK.get(a))) {
+                showNavBar(a);
+            }
+            return;
+        }
+        if (!NAV_HIDDEN_MARK.containsKey(a)) {
+            // 首次：记一条日志便于排查是否真的生效
+            if (navBarHeight(a) > 0) {
+                logFile("nav: keep-hidden engaged (h=" + navBarHeight(a) + ")");
+            }
+        }
+        // 无条件重新 hide：即使上一轮已经藏好，系统也可能刚把它恢复了。
+        // hide() 是幂等的，重复调用无副作用，代价远低于「漏一轮就露出小白条」。
+        hideNavBar(a);
+    }
+
+    /**
+     * App 进入前台：重置压制状态。
+     *
+     * <p>从后台回来时系统已把导航栏恢复，靠 {@link #applyNavAutoHide} 的周期压制
+     * 重新藏回去；这里只维护计数，不做多余动作。
+     */
+    public static void onAppForeground(Activity a) {
+        if (sForegroundCount++ == 0) {
+            logFile("nav: app -> foreground");
+        }
+    }
+
+    /**
+     * App 退到后台：恢复导航栏。
+     *
+     * <p><b>这是需求「退出软件才显示」的落点。</b>
+     * 只有整个 App 真正离开前台（计数器归零）才恢复 —— App 内部切 Activity 时
+     * 新旧页面会交错 pause，计数器保证不会误判。
+     */
+    public static void onAppBackground() {
+        sForegroundCount--;
+        if (sForegroundCount > 0) {
+            return;   // 还有本 App 的页面在前台，属于内部切换
+        }
+        sForegroundCount = 0;
+        // 把所有被我们藏过的页面都还回去
+        for (Activity act : new ArrayList<>(NAV_HIDDEN_MARK.keySet())) {
+            if (act != null) {
+                restoreNavBar(act);
+            }
+        }
+        logFile("nav: app background -> restore nav bar");
+    }
+
+    /**
+     * 无条件恢复导航栏（退出软件时用）。
+     *
+     * <p>与 {@link #showNavBar} 的区别：后者只在「确实是本模块藏的」时才恢复，
+     * 用于开关关闭；这里是退出场景，无论标记如何都要还回去，避免留下半截状态。
+     */
+    private static void restoreNavBar(Activity a) {
+        try {
+            WindowInsetsController ic = insetsController(a);
+            if (ic != null) {
+                ic.show(WindowInsets.Type.navigationBars());
+            } else {
+                View decor = a.getWindow().getDecorView();
+                if (decor != null) {
+                    decor.setSystemUiVisibility(decor.getSystemUiVisibility()
+                            & ~View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+                }
+            }
+        } catch (Throwable t) {
+            logFile("nav restore failed: " + t);
+        } finally {
+            NAV_HIDDEN_MARK.remove(a);
+        }
+    }
+
+    /**
+     * 导航栏高度（px）。从根窗口 insets 读，跨进程唯一可靠的来源。
+     *
+     * <p>隐藏后 insets 会归零，所以额外记一份「本页面见过的最大值」作为基线 ——
+     * 边缘感应带必须用真实高度，否则隐藏后带子会缩到只剩 24dp。
+     */
+    private static int navBarHeight(Activity a) {
+        try {
+            View decor = a.getWindow().getDecorView();
+            WindowInsets wi = decor.getRootWindowInsets();
+            if (wi == null) {
+                return 0;
+            }
+            Insets ins = wi.getInsets(WindowInsets.Type.navigationBars());
+            int now = ins != null ? ins.bottom : 0;
+            if (now > 0) {
+                NAV_BASE_H.put(a, now);
+                return now;
+            }
+            Integer base = NAV_BASE_H.get(a);
+            return base == null ? 0 : base;
+        } catch (Throwable t) {
+            return 0;
+        }
     }
 
     private static void applyDesired(View v, IdentityHashMap<View, int[]> desired) {

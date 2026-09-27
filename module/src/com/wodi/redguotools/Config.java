@@ -148,15 +148,12 @@ public final class Config {
         return get(c, "sb_hide", true);
     }
 
-    /** 默认状态下（数字未显示时）状态栏区域底色。 */
+    /** 状态栏区域底色。 */
     public static int statusBarBg(Context c) {
         return getInt(c, "sb_bg", BG_FOLLOW);
     }
 
-    /** 点击状态栏区域是否切换显示数字。 */
-    public static boolean tapToggle(Context c) {
-        return get(c, "sb_tap", true);
-    }
+    /* 状态栏「点击显示数字」配置（sb_tap）已移除 —— 该功能整体下线。 */
 
     /* ---------------- 统一透明度 ---------------- */
 
@@ -336,6 +333,22 @@ public final class Config {
 
     public static void setSpeedCustom(Context c, int v) {
         setInt(c, "speed_x10", Math.max(10, Math.min(40, v)));
+    }
+
+    /* ---------------- 底部导航栏 / 小白条：自动隐藏 ---------------- */
+
+    /**
+     * 底部导航栏（小白条）隐藏开关。
+     *
+     * <p>开启后：进入红果即隐藏导航栏，**软件内全程不显示**，只有退出红果时才恢复。
+     * 默认关闭 —— 不填就保持宿主原样。
+     */
+    public static boolean autoHideNav(Context c) {
+        return get(c, "nav_auto", false);
+    }
+
+    public static void setAutoHideNav(Context c, boolean v) {
+        set(c, "nav_auto", v);
     }
 
     /* ---------------- 写 ---------------- */

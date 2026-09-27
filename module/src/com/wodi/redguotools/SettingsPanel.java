@@ -71,13 +71,12 @@ public final class SettingsPanel {
             @Override
             public void onCheckedChanged(CompoundButton b, boolean v) {
                 Config.set(a, "sb_hide", v);
-                UiController.resetBarVisible(a, !v);
                 UiController.refresh(a);
             }
         });
         cardSb.addView(swHide);
 
-        TextView bgLabel = Theme.value(a, p, "状态栏底色（未显示数字时）");
+        TextView bgLabel = Theme.value(a, p, "状态栏底色");
         cardSb.addView(bgLabel);
 
         final RadioGroup rg = new RadioGroup(a);
@@ -109,19 +108,11 @@ public final class SettingsPanel {
         });
         cardSb.addView(rg);
 
-        Switch swTap = Theme.makeSwitch(a, p, "点击状态栏区域显示/隐藏数字", Config.tapToggle(a));
-        swTap.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton b, boolean v) {
-                Config.set(a, "sb_tap", v);
-                UiController.refresh(a);
-            }
-        });
-        cardSb.addView(swTap);
+        /* 状态栏「点击显示数字」开关已移除 —— 该功能整体下线。 */
 
         /*
          * 全局叠加透明度：作用于「组件显隐」各项与自定义清单命中的组件，
-         * 所以它是独立一张卡 —— 放在「状态栏」卡里会让人以为只管状态栏。
+         * 所以它独立成一张卡，避免让人误以为只管某类组件。
          */
         LinearLayout cardAlpha = addCard(a, p, root, "alpha", "叠加组件透明度", false);
         TextView alphaHint = Theme.hint(a, p, "统一乘在所有叠加组件上，与各项自己的透明度叠加生效");
@@ -173,6 +164,37 @@ public final class SettingsPanel {
                 bottomTabsDialog(a);
             }
         }));
+
+        /* ---------- 卡片：底部导航栏 / 小白条隐藏 ---------- */
+        LinearLayout cardNav = addCard(a, p, root, "navbar", "底部导航栏 / 小白条", true);
+        TextView navHint = Theme.hint(a, p,
+                "开启后，进入红果即隐藏导航栏；软件内全程不显示，"
+                        + "只有退出红果时才会恢复");
+        navHint.setPadding(0, 0, 0, Theme.dp(a, 4));
+        cardNav.addView(navHint);
+
+        Switch swNav = Theme.makeSwitch(a, p, "隐藏底部导航栏（小白条）", Config.autoHideNav(a));
+        swNav.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton b, boolean v) {
+                Config.setAutoHideNav(a, v);
+                UiController.refresh(a);
+                rebuild(a);
+            }
+        });
+        cardNav.addView(swNav);
+
+        // 状态行：一眼看出开关是否已生效（面板能打开说明 App 在前台，正常应显示「已生效」）
+        TextView navState = Theme.value(a, p, UiController.navBarEnableState());
+        navState.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        navState.setPadding(0, Theme.dp(a, 6), 0, 0);
+        cardNav.addView(navState);
+
+        // 诊断行：确认本机到底有没有可隐藏的小白条，避免开了开关却毫无反应时瞎猜
+        TextView navStat = Theme.hint(a, p, UiController.navBarStatus(a));
+        navStat.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        navStat.setPadding(0, Theme.dp(a, 4), 0, 0);
+        cardNav.addView(navStat);
 
         /* ---------- 卡片：播放画质 / 倍速 ---------- */
         LinearLayout cardPlay = addCard(a, p, root, "play", "播放画质 / 倍速", true);

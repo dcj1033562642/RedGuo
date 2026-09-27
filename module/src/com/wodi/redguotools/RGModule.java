@@ -129,6 +129,22 @@ public class RGModule extends XposedModule {
                     }
                     return chain.proceed();
                 });
+
+        // 前台状态跟踪：用来区分「App 内部切页面」与「真的离开 App」。
+        // 导航栏全程隐藏，只有整个 App 退到后台才恢复 —— 见 UiController.onAppBackground()。
+        Method onStop = Activity.class.getDeclaredMethod("onStop");
+        hook(onStop).setId("rgActStop").setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept(chain -> {
+                    Object self = chain.getThisObject();
+                    Object r = chain.proceed();
+                    try {
+                        if (self instanceof Activity && UiController.isHostActivity((Activity) self)) {
+                            UiController.onAppBackground();
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    return r;
+                });
         log(Log.INFO, TAG, "hooked Activity lifecycle");
     }
 

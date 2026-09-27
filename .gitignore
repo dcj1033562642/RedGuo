@@ -1,0 +1,24 @@
+# ---- 逆向分析产物（体积大 / 含第三方版权内容，不入库）----
+_apk/
+_apk_real/
+_dec_K_apk/
+_recon/
+_tools/
+
+# ---- 构建输出（APK 通过 Release 附件分发，不进源码库）----
+out/
+
+# ---- 运行期日志与抓图 ----
+log*.txt
+*.log
+rg_c.png
+
+# ---- 编辑器 / 系统 ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 工作区本地数据 ----
+.workbuddy/
